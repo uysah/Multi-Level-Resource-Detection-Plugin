@@ -1,0 +1,567 @@
+import math
+from datetime import datetime
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import pm4py
+from pm4py.objects.ocel.obj import OCEL
+from pulp import *
+import json
+
+from ..resource import ResourceDetection
+
+
+def o2o_tuples(ocel: OCEL):
+    return np.array(list(zip(ocel.o2o["ocel:oid_2"], ocel.o2o["ocel:oid"], strict=False))).tolist()
+
+
+def create_event_dict(ocel: OCEL) -> dict:
+    # Step 1: Get full event table
+    df = ocel.get_extended_table()
+
+    # Step 2: Rename standard columns
+    df = df.rename(columns={"ocel:timestamp": "timestamp", "ocel:activity": "event_type"})
+
+    # Step 3: Convert timestamp to naive datetime
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+
+    # Step 4: Identify and rename object type columns
+    type_cols = [col for col in df.columns if col.startswith("ocel:type:")]
+    rename_map = {col: col.replace("ocel:type:", "") for col in type_cols}
+    df = df.rename(columns=rename_map)
+
+    object_cols = list(rename_map.values())
+
+    def _normalize_obj_cell(v):
+        if v is None or (not isinstance(v, (list, set, tuple, np.ndarray)) and pd.isna(v)):
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, (set, tuple, np.ndarray)):
+            return list(v)
+        return [v]
+
+    if object_cols:
+        df.loc[:, object_cols] = df.loc[:, object_cols].apply(lambda col: col.map(_normalize_obj_cell))
+        # Step 6: Add a new "objects" column: merged object IDs from all types
+        df["objects"] = df[object_cols].apply(
+            lambda row: [item for sublist in row for item in sublist],
+            axis=1,
+        )
+    else:
+        # No object-type columns present → no objects per event
+        df["objects"] = [[] for _ in range(len(df))]
+
+    # Step 7: Return as dict with event ID as key
+    return df.set_index(ocel.event_id_column).to_dict(orient="index")
+
+
+def compute_event_object_graph(ocel: OCEL) -> nx.DiGraph:
+    """
+    Builds a directed event-object graph (EOG) from an OCEL using directly-follows per object.
+
+    Each event becomes a node, and edges are added between events that refer to the same object
+    and occur consecutively in time.
+
+    :param ocel: PM4Py OCEL object
+    :return: networkx.DiGraph representing the EOG
+    """
+    event_object_graph = nx.DiGraph()
+
+    # Step 1: Add each event as a node in the graph
+    event_ids = ocel.events[ocel.event_id_column].to_list()
+    event_object_graph.add_nodes_from(event_ids)
+
+    # Step 2: Sort and group by object, then generate adjacent event pairs
+    object_with_sorted_events = (
+        ocel.relations.sort_values(ocel.event_timestamp)
+        .groupby(ocel.object_id_column)["ocel:eid"]
+        .apply(lambda lst: list(zip(lst, lst[1:], strict=False)))  # adjacent pairs only
+        .explode()
+        .dropna()
+        .to_list()
+    )
+
+    # Step 3: Add those event-event edges to the graph
+    event_object_graph.add_edges_from(object_with_sorted_events)
+
+    return event_object_graph
+
+
+def compute_process_executions_connected_components(ocel: OCEL):
+    return sorted(
+        nx.weakly_connected_components(compute_event_object_graph(ocel)),
+        key=len,
+        reverse=True,
+    )
+
+
+def get_object_types(ocel: OCEL):
+    return pm4py.ocel_get_object_types(ocel)
+
+
+TR_TOTAL = "total"
+TR_DEPENDENT = "D"
+TR_DEPENDENT_INVERSE = "Di"
+TR_INITIATING = "I"
+TR_INITIATING_REVERSE = "Ii"
+TR_PARALLEL = "P"
+
+# Event cardinality constants
+EC_TOTAL = "total"
+EC_ZERO = "0"
+EC_ONE = "1"
+EC_ZERO_ONE = "0...1"
+EC_MANY = "1..*"
+EC_ZERO_MANY = "0...*"
+
+# Event cardinality constants
+LC_TOTAL = "total"
+LC_ZERO = "0"
+LC_ONE = "1"
+LC_ZERO_ONE = "0...1"
+LC_MANY = "1..*"
+LC_ZERO_MANY = "0...*"
+DATEFORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def get_most_precise_lc(directed_type_tuple, tau, log_cardinalities):
+    total = 0
+    if directed_type_tuple in log_cardinalities.keys() and LC_TOTAL in log_cardinalities[directed_type_tuple].keys():
+        total = log_cardinalities[directed_type_tuple][LC_TOTAL]
+
+    if total == 0:
+        return None
+
+    if (LC_ZERO in log_cardinalities[directed_type_tuple].keys()) and (
+        (log_cardinalities[directed_type_tuple][LC_ZERO] / total) >= tau
+    ):
+        return LC_ZERO
+    if (LC_ONE in log_cardinalities[directed_type_tuple].keys()) and (
+        (log_cardinalities[directed_type_tuple][LC_ONE] / total) >= tau
+    ):
+        return LC_ONE
+    if (LC_ZERO_ONE in log_cardinalities[directed_type_tuple].keys()) and (
+        (log_cardinalities[directed_type_tuple][LC_ZERO_ONE] / total) >= tau
+    ):
+        return LC_ZERO_ONE
+    if (LC_MANY in log_cardinalities[directed_type_tuple].keys()) and (
+        (log_cardinalities[directed_type_tuple][LC_MANY] / total) >= tau
+    ):
+        return LC_MANY
+    if (LC_ZERO_MANY in log_cardinalities[directed_type_tuple].keys()) and (
+        (log_cardinalities[directed_type_tuple][LC_ZERO_MANY] / total) >= tau
+    ):
+        return LC_ZERO_MANY
+
+    return None
+
+
+def get_most_precise_ec(directed_type_tuple, tau, event_cardinalities):
+    total = 0
+    if (
+        directed_type_tuple in event_cardinalities.keys()
+        and EC_TOTAL in event_cardinalities[directed_type_tuple].keys()
+    ):
+        total = event_cardinalities[directed_type_tuple][EC_TOTAL]
+
+    if total == 0:
+        return None
+
+    if (EC_ZERO in event_cardinalities[directed_type_tuple].keys()) and (
+        (event_cardinalities[directed_type_tuple][EC_ZERO] / total) >= tau
+    ):
+        return EC_ZERO
+    if (EC_ONE in event_cardinalities[directed_type_tuple].keys()) and (
+        (event_cardinalities[directed_type_tuple][EC_ONE] / total) >= tau
+    ):
+        return EC_ONE
+    if (EC_ZERO_ONE in event_cardinalities[directed_type_tuple].keys()) and (
+        (event_cardinalities[directed_type_tuple][EC_ZERO_ONE] / total) >= tau
+    ):
+        return EC_ZERO_ONE
+    if (EC_MANY in event_cardinalities[directed_type_tuple].keys()) and (
+        (event_cardinalities[directed_type_tuple][EC_MANY] / total) >= tau
+    ):
+        return EC_MANY
+    if (EC_ZERO_MANY in event_cardinalities[directed_type_tuple].keys()) and (
+        (event_cardinalities[directed_type_tuple][EC_ZERO_MANY] / total) >= tau
+    ):
+        return EC_ZERO_MANY
+
+    return None
+
+
+def get_most_precise_tr(directed_type_tuple, tau, temporal_relation):
+    total = 0
+    if directed_type_tuple in temporal_relation.keys() and EC_TOTAL in temporal_relation[directed_type_tuple].keys():
+        total = temporal_relation[directed_type_tuple][EC_TOTAL]
+
+    if total == 0:
+        return None
+
+    if (TR_DEPENDENT in temporal_relation[directed_type_tuple].keys()) and (
+        (temporal_relation[directed_type_tuple][TR_DEPENDENT] / total) >= tau
+    ):
+        return TR_DEPENDENT
+    if (TR_DEPENDENT_INVERSE in temporal_relation[directed_type_tuple].keys()) and (
+        (temporal_relation[directed_type_tuple][TR_DEPENDENT_INVERSE] / total) >= tau
+    ):
+        return TR_DEPENDENT_INVERSE
+    if (TR_INITIATING in temporal_relation[directed_type_tuple].keys()) and (
+        (temporal_relation[directed_type_tuple][TR_INITIATING] / total) >= tau
+    ):
+        return TR_INITIATING
+    if (TR_INITIATING_REVERSE in temporal_relation[directed_type_tuple].keys()) and (
+        (temporal_relation[directed_type_tuple][TR_INITIATING_REVERSE] / total) >= tau
+    ):
+        return TR_INITIATING_REVERSE
+    if (TR_PARALLEL in temporal_relation[directed_type_tuple].keys()) and (
+        (temporal_relation[directed_type_tuple][TR_PARALLEL] / total) >= tau
+    ):
+        return TR_PARALLEL
+
+    return None
+
+
+
+
+def to_string(pair: tuple[str, str]) -> str:
+    return f"{pair[0]}__{pair[1]}"
+
+
+def connected_components_undirected(types_of_level: list, type_relations) -> list:
+    """
+    Computes the connected components among a set of object types, given a set of
+    (undirected) relations between object types.
+
+    Only relations whose both endpoints are part of `types_of_level` are considered;
+    types with no relation to any other type in the level end up as singleton components.
+
+    :param types_of_level: list of object types belonging to one layer/level
+    :param type_relations: iterable of (type1, type2) tuples describing relations
+                            between object types (treated as undirected edges)
+    :return: list of sets, each set being a connected component of object types
+    """
+    graph = nx.Graph()
+
+    # ensure every type of this level is a node, even if it has no relations
+    graph.add_nodes_from(types_of_level)
+
+    types_of_level_set = set(types_of_level)
+
+    # only keep edges where both endpoints belong to this level
+    edges = [
+        (t1, t2)
+        for (t1, t2) in type_relations
+        if t1 in types_of_level_set and t2 in types_of_level_set
+    ]
+    graph.add_edges_from(edges)
+
+    return list(nx.connected_components(graph))
+
+def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
+    #########################################################################
+    #                           Start of totem Part                         #
+    #########################################################################
+    # object type to event type dict
+    obj_typ_to_ev_type: dict[str, set[str]] = dict()
+    all_event_types = set()
+
+    # temporal relations results
+    h_temporal_relations: dict[tuple[str, str], dict[str, int]] = dict()  # stores all the temporal relations found
+    # event cardinality results
+    h_event_cardinalities: dict[tuple[str, str], dict[str, int]] = dict()  # stores all the temporal cardinalities found
+    # event cardinality results
+    h_log_cardinalities: dict[tuple[str, str], dict[str, int]] = dict()  # stores all the temporal cardinalities found
+
+    # object min times (omint_L(o))
+    o_min_times: dict[
+        str, datetime] = dict()  # str identifier of the object maps to the earliest time recorded for that object in the event log
+    # object max times (omaxt_L(o))
+    o_max_times: dict[
+        str, datetime] = dict()  # str identifier of the object maps to the last time recorded for that object in the event log
+
+    # get a list of all object types (or variable that is filled while passing through the process executions)
+    type_relations: set[set[str, str]] = set()  # stores all connected types
+
+    o2o_o2o: dict[str, dict[str, set[
+        str]]] = dict()  # dict that describes which objects are connected to which types and for each type which object
+    # o2o[obj1][type3] = [obj5, obj6]
+    o2o_e2o: dict[str, dict[str, set[str]]] = dict()
+    o2o: dict[str, dict[str, set[str]]] = dict()
+
+    # a mapping from type to its objects
+    type_to_object = dict()
+    event_dict = create_event_dict(ocel)
+    object_types = get_object_types(ocel)
+
+    for px in compute_process_executions_connected_components(ocel):
+        for ev in px:
+            # event infos: objects and timestamps
+            ev_timestamp = event_dict[ev]["timestamp"]
+
+            objects_of_event = event_dict[ev]["objects"]
+            for obj in objects_of_event:
+                # o2o updating
+                o2o.setdefault(obj, dict())
+                for type in object_types:
+                    o2o[obj].setdefault(type, set())
+                    o2o[obj][type].update(
+                        event_dict[ev][type])  # add all objects connected via e2o to each object involved
+                # update lifespan information
+                o_min_times.setdefault(obj, ev_timestamp)
+                if ev_timestamp < o_min_times[obj]:  # todo check if comparison of datetimes works correctly here
+                    o_min_times[obj] = ev_timestamp
+                o_max_times.setdefault(obj, ev_timestamp)
+                if ev_timestamp > o_max_times[obj]:  # todo check if comparison of datetimes works correctly here
+                    o_max_times[obj] = ev_timestamp
+
+            # maintain object type to event type dictionary
+            eventtype = event_dict[ev]['event_type']
+            all_event_types.add(eventtype)
+            for type in object_types:
+                if len(event_dict[ev][type]) > 0:
+                    obj_typ_to_ev_type.setdefault(type, set())
+                    obj_typ_to_ev_type[type].add(eventtype)
+
+            # compute event cardinality
+            involved_types = []
+            obj_count_per_type = dict()
+            for type in object_types:
+                obj_list = event_dict[ev][type]
+                if not obj_list:
+                    continue
+                else:
+                    type_to_object.setdefault(type, set())
+                    type_to_object[type].update(obj_list)
+                    involved_types.append(type)
+                    obj_count_per_type[type] = len(obj_list)
+            # created related types
+            for t1 in involved_types:
+                for t2 in involved_types:
+                    if t1 != t2:
+                        type_relations.add(frozenset({t1, t2}))
+            # for all type pairs determine
+            for type_source in involved_types:
+                for type_target in involved_types:
+                    # add one to total
+                    h_event_cardinalities.setdefault((type_source, type_target), dict())
+                    h_event_cardinalities[(type_source, type_target)].setdefault(EC_TOTAL, 0)
+                    h_event_cardinalities[(type_source, type_target)][EC_TOTAL] += 1
+                    # determine cardinality
+                    cardinality = 0
+                    if type_target in obj_count_per_type.keys():
+                        cardinality = obj_count_per_type[type_target]
+                    # add one to matching cardinalities
+                    if cardinality == 0:
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ZERO, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ZERO] += 1
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ZERO_ONE, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ZERO_ONE] += 1
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ZERO_MANY, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ZERO_MANY] += 1
+                    elif cardinality == 1:
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ONE, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ONE] += 1
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ZERO_ONE, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ZERO_ONE] += 1
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_MANY, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_MANY] += 1
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ZERO_MANY, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ZERO_MANY] += 1
+                    elif cardinality > 1:
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_MANY, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_MANY] += 1
+                        h_event_cardinalities[(type_source, type_target)].setdefault(EC_ZERO_MANY, 0)
+                        h_event_cardinalities[(type_source, type_target)][EC_ZERO_MANY] += 1
+
+    # merge o2o and e2o connected objects
+    for source_o, target_o in o2o_tuples(ocel):
+        # print(f"{source_o} - {target_o}")
+        type_of_target_o = None
+        for type in object_types:
+            if target_o in type_to_object[type]:
+                type_of_target_o = type
+                break
+        if type_of_target_o == None:
+            continue
+        o2o.setdefault(source_o, dict())
+        o2o[source_o].setdefault(type_of_target_o, set())
+        o2o[source_o][type_of_target_o].update([source_o])
+
+    # compute log cardinality
+    for type_source in object_types:
+        for type_target in object_types:
+            h_temporal_relations.setdefault((type_source, type_target), dict())
+            for obj in type_to_object[type_source]:
+                h_log_cardinalities.setdefault((type_source, type_target), dict())
+                h_log_cardinalities[(type_source, type_target)].setdefault(LC_TOTAL, 0)
+                h_log_cardinalities[(type_source, type_target)][LC_TOTAL] += 1
+
+                cardinality = len(o2o[obj][type_target])
+                # if type_source == 'products':
+                #    print(f"Obj: {obj} Typ: {type_target} Card: {cardinality}")
+
+                if cardinality == 0:
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ZERO, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ZERO] += 1
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ZERO_ONE, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ZERO_ONE] += 1
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ZERO_MANY, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ZERO_MANY] += 1
+                elif cardinality == 1:
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ONE, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ONE] += 1
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ZERO_ONE, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ZERO_ONE] += 1
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_MANY, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_MANY] += 1
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ZERO_MANY, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ZERO_MANY] += 1
+                elif cardinality > 1:
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_MANY, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_MANY] += 1
+                    h_log_cardinalities[(type_source, type_target)].setdefault(LC_ZERO_MANY, 0)
+                    h_log_cardinalities[(type_source, type_target)][LC_ZERO_MANY] += 1
+
+                # compute temporal relations
+                for obj_target in o2o[obj][type_target]:
+                    h_temporal_relations[(type_source, type_target)].setdefault(TR_TOTAL, 0)
+                    h_temporal_relations[(type_source, type_target)][TR_TOTAL] += 1
+                    if o_min_times[obj_target] <= o_min_times[obj] <= o_max_times[obj] <= o_max_times[obj_target]:
+                        h_temporal_relations[(type_source, type_target)].setdefault(TR_DEPENDENT, 0)
+                        h_temporal_relations[(type_source, type_target)][TR_DEPENDENT] += 1
+                    if o_min_times[obj] <= o_min_times[obj_target] <= o_max_times[obj_target] <= o_max_times[obj]:
+                        h_temporal_relations[(type_source, type_target)].setdefault(TR_DEPENDENT_INVERSE, 0)
+                        h_temporal_relations[(type_source, type_target)][TR_DEPENDENT_INVERSE] += 1
+                    if (o_min_times[obj] <= o_max_times[obj] <= o_min_times[obj_target] <= o_max_times[obj_target]) or (
+                            o_min_times[obj] < o_min_times[obj_target] <= o_max_times[obj] < o_max_times[obj_target]):
+                        h_temporal_relations[(type_source, type_target)].setdefault(TR_INITIATING, 0)
+                        h_temporal_relations[(type_source, type_target)][TR_INITIATING] += 1
+                    if (o_min_times[obj_target] <= o_max_times[obj_target] <= o_min_times[obj] <= o_max_times[obj]) or (
+                            o_min_times[obj_target] < o_min_times[obj] <= o_max_times[obj_target] < o_max_times[obj]):
+                        h_temporal_relations[(type_source, type_target)].setdefault(TR_INITIATING_REVERSE, 0)
+                        h_temporal_relations[(type_source, type_target)][TR_INITIATING_REVERSE] += 1
+                    # allways parallel
+                    h_temporal_relations[(type_source, type_target)].setdefault(TR_PARALLEL, 0)
+                    h_temporal_relations[(type_source, type_target)][TR_PARALLEL] += 1
+
+    # setup temporal graph
+    tempgraph = {
+        'nodes': set(),
+        TR_PARALLEL: set(),
+        TR_INITIATING: set(),
+        TR_DEPENDENT: set(),
+    }
+
+    # for each connection give the 6 relations
+    for connected_types in type_relations:
+        t1, t2 = connected_types
+        tempgraph['nodes'].add(t1)
+        tempgraph['nodes'].add(t2)
+        print(f"{t1} -> {t2}")
+
+        # get log cardinality
+        lc = get_most_precise_lc((t1, t2), tau, h_log_cardinalities)
+        lc_i = get_most_precise_lc((t2, t1), tau, h_log_cardinalities)
+        # get event cardinality
+        ec = get_most_precise_ec((t1, t2), tau, h_event_cardinalities)
+        ec_i = get_most_precise_ec((t2, t1), tau, h_event_cardinalities)
+        # get temporal relation
+        tr = get_most_precise_tr((t1, t2), tau, h_temporal_relations)
+        tr_i = get_most_precise_tr((t2, t1), tau, h_temporal_relations)
+        # add relation to tempgraph
+        if tr == TR_DEPENDENT_INVERSE or tr == TR_INITIATING_REVERSE:
+            tempgraph[tr_i].add((t2, t1))
+        else:
+            tempgraph[tr].add((t1, t2))
+        # print(f"TRi: {tr_i}")
+
+    tempGraph = tempgraph
+    model = LpProblem(name="layer-assignment")
+    # Define the decision variables
+    level = {i: LpVariable(name=f"level-{i}", lowBound=0, cat='Integer') for i in tempGraph['nodes']}
+    z_parallel = {to_string((t1, t2)): LpVariable(name=f"hp-{to_string((t1, t2))}") for (t1, t2) in
+                  tempGraph[TR_PARALLEL]}
+    z_initiating = {to_string((t1, t2)): LpVariable(name=f"hi-{to_string((t1, t2))}") for (t1, t2) in
+                    tempGraph[TR_INITIATING]}
+
+    # constraints
+    for (t1, t2) in tempGraph[TR_DEPENDENT]:
+        c = level[t2] - level[t1] >= 1
+        model += c
+
+    # for parallel we want to minimize the absolute distance. For absolute values one needs an additional constraint
+    for (t1, t2) in tempGraph[TR_PARALLEL]:
+        c1 = level[t1] - level[t2] - z_parallel[to_string((t1, t2))] <= 0
+        c2 = level[t2] - level[t1] - z_parallel[to_string((t1, t2))] <= 0
+        model += c1
+        model += c2
+
+    # for initiating we want to minimize the absolute distance. For absolute values one needs an additional constraint
+    for (t1, t2) in tempGraph[TR_INITIATING]:
+        c1 = level[t1] - level[t2] - z_initiating[to_string((t1, t2))] <= 0
+        c2 = level[t2] - level[t1] - z_initiating[to_string((t1, t2))] <= 0
+        model += c1
+        model += c2
+
+    # objective Function
+    obj_func = pulp.lpSum(
+        [level[t2] - level[t1] for (t1, t2) in tempGraph[TR_DEPENDENT]] + [z_parallel[to_string((t1, t2))] for (t1, t2)
+                                                                           in tempGraph[TR_PARALLEL]] + [
+            z_initiating[to_string((t1, t2))] for (t1, t2) in tempGraph[TR_INITIATING]])
+    model += obj_func
+
+    # solve the model
+    status = model.solve()
+
+    #print
+    for var in level.values():
+        print(f"{var.name}: {var.value()}")
+
+    levels_dict = dict()
+    for type in tempGraph['nodes']:
+        # print(f"{level[type].name}: {level[type].value()}")
+        levels_dict.setdefault(level[type].value(), set())
+        levels_dict[level[type].value()].add(type)
+
+    resulting_process_view = {}
+    print("Assignment of object types to layers:")
+    print(levels_dict)
+    print("")
+
+    sorted_levels = [float(k) for k in levels_dict.keys()]
+    sorted_levels.sort()  # starting from the lowest level to the highest level
+    for l in sorted_levels:
+        types_of_level = list(levels_dict[l])
+        connected_components_undirected(types_of_level, type_relations)
+        resulting_process_view[l] = connected_components_undirected(types_of_level, type_relations)
+
+    print("Process View (without matching event types):")
+    print(resulting_process_view)
+    print("")
+
+    resulting_process_view_with_events = {}
+    # starting from the lowest to the highest level assign the eventtypes to the object groups
+    remaining_ev_types = set(list(all_event_types))
+    for l in sorted_levels:
+        ccs_with_event_types = []
+        for cc in resulting_process_view[l]:
+            requested_event_types = set()
+            for type in cc:
+                requested_event_types = requested_event_types.union(obj_typ_to_ev_type[type])
+                # print(f"{type} requests: {requested_event_types}")
+
+            assigned_event_types = requested_event_types.intersection(remaining_ev_types)
+            # add cc and event types to result
+            ccs_with_event_types.append((cc, assigned_event_types))
+            # upadate remaining eventtypes
+            remaining_ev_types = remaining_ev_types - assigned_event_types
+
+        resulting_process_view_with_events[l] = ccs_with_event_types
+
+    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=type_relations)
+
+
