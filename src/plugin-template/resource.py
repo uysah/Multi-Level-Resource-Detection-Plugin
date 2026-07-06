@@ -7,6 +7,7 @@ from ocelescope.visualization.default.graph import (
     GraphEdge,
     GraphNode,
     GraphvizLayoutConfig,
+    ElkLayoutConfig
 )
 from ocelescope.visualization.util.color import generate_color_map
 from pydantic import BaseModel
@@ -117,14 +118,26 @@ class ResourceDetection(Resource):
     description = "Multi-Level Resource Detection Graph"
 
     object_types_to_layer: Dict[float, Set[str]]
-    type_relations: Set[FrozenSet[str]]
+    type_relations: list[TotemEdge]
 
-    _LEVEL_COLOR = "#a9c9ec"
+   
 
     def visualize(self) -> Graph:
         nodes: list[GraphNode] = []
         edges: list[GraphEdge] = []
-
+        
+        color_map = generate_color_map(list(self.object_types_to_layer.keys()))
+        def tr_to_arrow(tr: Temporal_Relation_Constant | None) -> EdgeArrow:
+            mapping: dict[Temporal_Relation_Constant | None, EdgeArrow] = {
+                "P": "triangle",
+                "D": "tee",
+                "I": "circle",
+                "Ii": None,
+                "Di": None,
+                None: None,
+            }
+            return mapping[tr]
+    
         for level, object_types in self.object_types_to_layer.items():
             for obj_type in sorted(object_types):
                 nodes.append(
@@ -132,32 +145,48 @@ class ResourceDetection(Resource):
                         id=obj_type,
                         label=obj_type,
                         shape="rectangle",
-                        color="white",
-                        border_color=self._LEVEL_COLOR,
+                        width=max(90.0, len(obj_type) * 8.0 + 24.0),
+                        height=40,
+                        color=color_map.get(level),
                         rank=int(level),
-                        layout_attrs={"group": f"level_{int(level)}"},
+                        layout_attrs={"elk.layered.layering.layerId": str(int(level))},
                     )
                 )
         
-        for relation in self.type_relations:
-            source, target = tuple(relation)
+        for e in self.type_relations:
+            src_arrow = tr_to_arrow(e.tr_inverse)
+            tgt_arrow = tr_to_arrow(e.tr)
             edges.append(
                 GraphEdge(
-                    source=target,
-                    target=source,
-                    label=None,
-                    end_arrow="triangle"
+                    source=e.source,
+                    target=e.target,
+                    start_arrow=src_arrow,
+                    end_arrow=tgt_arrow,
+                    layout_attrs={"constraint": False},
                 )
             )
 
-        layout_config = GraphvizLayoutConfig(
-            engine="dot",
-            graphAttrs={"rankdir": "BT", "splines": "spline", "nodesep": "0.5", "ranksep": "0.8"},
-            nodeAttrs={"style": "filled,rounded", "fontname": "Helvetica"},
-            edgeAttrs={"fontname": "Helvetica", "fontsize": 9},
-        )
+        layout_config = ElkLayoutConfig(
+                options={
+                    "elk.algorithm": "layered",
+                    "elk.direction": "UP",
+                    "elk.spacing.nodeNode": "80",
+                    "elk.layered.spacing.nodeNodeBetweenLayers": "150",
+                    "elk.spacing.edgeNode": "40",
+                    "elk.layered.spacing.edgeNodeBetweenLayers": "40",
+                    "elk.spacing.edgeEdge": "20",
+                    "elk.layered.spacing.edgeEdgeBetweenLayers": "20",
+                    "elk.padding": "[top=40,left=40,bottom=40,right=40]",
+                    "elk.spacing.labelNode": "10",
+                    "elk.spacing.edgeLabel": "10",
+                    "elk.spacing.componentComponent": "100",
+                    "elk.edgeRouting": "SPLINES",  
+                }
+            )
+        print(nodes)
+        print(edges)
 
-        return Graph(nodes=nodes, edges=edges, layout_config=layout_config)
+        return Graph(nodes=nodes,edges=edges,layout_config=layout_config)
 
     def all_object_types(self) -> Set[str]:
         result: list = []

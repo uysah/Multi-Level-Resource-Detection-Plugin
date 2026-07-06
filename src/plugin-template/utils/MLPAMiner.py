@@ -9,7 +9,7 @@ from pm4py.objects.ocel.obj import OCEL
 from pulp import *
 import json
 
-from ..resource import ResourceDetection
+from ..resource import ResourceDetection, TotemEdge
 
 
 def o2o_tuples(ocel: OCEL):
@@ -391,6 +391,8 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
         o2o[source_o].setdefault(type_of_target_o, set())
         o2o[source_o][type_of_target_o].update([source_o])
 
+    result: list[TotemEdge] = []
+
     # compute log cardinality
     for type_source in object_types:
         for type_target in object_types:
@@ -477,7 +479,41 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
             tempgraph[tr_i].add((t2, t1))
         else:
             tempgraph[tr].add((t1, t2))
-        # print(f"TRi: {tr_i}")
+        print(f"TRi: {tr_i}")
+
+        relation = TotemEdge(
+                source=t1,
+                target=t2,
+                lc=lc,
+                lc_inverse=lc_i,
+                ec=ec,
+                ec_inverse=ec_i,
+                tr=tr,
+                tr_inverse=tr_i,
+            )
+        result.append(relation)
+
+        edge_map: dict[tuple[str, str], TotemEdge] = {}
+
+    for rel in result:
+        if any(
+            value == "ERROR 0"
+            for value in [
+                rel.lc,
+                rel.lc_inverse,
+                rel.ec,
+                rel.ec_inverse,
+                rel.tr,
+                rel.tr_inverse,
+            ]
+        ):
+            continue
+
+        pair_key = (rel.source, rel.target)
+        edge_map[pair_key] = rel  # last one wins
+
+    edges: list[TotemEdge] = list(edge_map.values())
+    print(edges)
 
     tempGraph = tempgraph
     model = LpProblem(name="layer-assignment")
@@ -562,6 +598,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
 
         resulting_process_view_with_events[l] = ccs_with_event_types
 
-    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=type_relations)
+    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=edges)
 
 
