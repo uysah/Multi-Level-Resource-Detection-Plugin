@@ -137,22 +137,78 @@ class ResourceDetection(Resource):
                 None: None,
             }
             return mapping[tr]
-    
-        for level, object_types in self.object_types_to_layer.items():
-            for obj_type in sorted(object_types):
+
+        neighbors: dict[str, set[str]] = {}
+        for e in self.type_relations:
+            neighbors.setdefault(e.source, set()).add(e.target)
+            neighbors.setdefault(e.target, set()).add(e.source)
+
+        sorted_levels = sorted(self.object_types_to_layer.keys())
+        color_map = generate_color_map([str(level) for level in sorted_levels])
+
+        y_gap = 150.0
+        x_gap = 180.0
+
+        node_x: dict[str, float] = {}
+        node_y: dict[str, float] = {}
+        node_width: dict[str, float] = {}
+
+        for level in sorted_levels:
+            types_this_level = list(self.object_types_to_layer[level])
+
+            def sort_key(obj_type: str) -> tuple[float, str]:
+                placed = [node_x[n] for n in neighbors.get(obj_type, ()) if n in node_x]
+                if placed:
+                    return (sum(placed) / len(placed), obj_type)
+                return (float("inf"), obj_type)
+
+            types_this_level.sort(key=sort_key)
+
+            x = 0.0
+            for obj_type in types_this_level:
+                width = max(90.0, len(obj_type) * 8.0 + 24.0)
+                node_x[obj_type] = x
+                node_y[obj_type] = level * y_gap
+                node_width[obj_type] = width
+                x += width + x_gap
+
+        nodes: list[GraphNode] = []
+        label_x_offset = -220.0
+        for level in sorted_levels:
+            for obj_type in sorted(self.object_types_to_layer[level]):
+                x, y = node_x[obj_type], node_y[obj_type]
                 nodes.append(
                     GraphNode(
                         id=obj_type,
                         label=obj_type,
                         shape="rectangle",
-                        width=max(90.0, len(obj_type) * 8.0 + 24.0),
+                        width=node_width[obj_type],
                         height=40,
-                        color=color_map.get(level),
+                        x=x,
+                        y=y,
+                        color=color_map.get(str(level)),
                         rank=int(level),
-                        layout_attrs={"elk.layered.layering.layerId": str(int(level))},
+                        layout_attrs={"pos": f"{x},{y}!"},
                     )
                 )
-        
+
+            label_y = level * y_gap
+            nodes.append(
+                GraphNode(
+                    id=f"__level_label_{level}",
+                    label=f"Level {int(level)}",
+                    shape="rectangle",      
+                    width=80.0,
+                    height=40.0,
+                    x=label_x_offset,
+                    y=label_y,
+                    color=None,
+                    border_color="#a9c9ec",     
+                    layout_attrs={"pos": f"{label_x_offset},{label_y}!"},
+                )
+            )
+
+        edges: list[GraphEdge] = []
         for e in self.type_relations:
             src_arrow = tr_to_arrow(e.tr_inverse)
             tgt_arrow = tr_to_arrow(e.tr)
@@ -162,31 +218,24 @@ class ResourceDetection(Resource):
                     target=e.target,
                     start_arrow=src_arrow,
                     end_arrow=tgt_arrow,
-                    layout_attrs={"constraint": False},
                 )
             )
 
-        layout_config = ElkLayoutConfig(
-                options={
-                    "elk.algorithm": "layered",
-                    "elk.direction": "UP",
-                    "elk.spacing.nodeNode": "80",
-                    "elk.layered.spacing.nodeNodeBetweenLayers": "150",
-                    "elk.spacing.edgeNode": "40",
-                    "elk.layered.spacing.edgeNodeBetweenLayers": "40",
-                    "elk.spacing.edgeEdge": "20",
-                    "elk.layered.spacing.edgeEdgeBetweenLayers": "20",
-                    "elk.padding": "[top=40,left=40,bottom=40,right=40]",
-                    "elk.spacing.labelNode": "10",
-                    "elk.spacing.edgeLabel": "10",
-                    "elk.spacing.componentComponent": "100",
-                    "elk.edgeRouting": "SPLINES",  
-                }
-            )
+        graph = Graph(
+            nodes=nodes,
+            edges=edges,
+            layout_config=GraphvizLayoutConfig(
+                engine="neato",
+                graphAttrs={
+                    "overlap": "false",
+                    "splines": "true",
+                    "inputscale": "72",
+                    "esep": "+20",  
+                },
+            ),
+        )
         print(nodes)
-        print(edges)
-
-        return Graph(nodes=nodes,edges=edges,layout_config=layout_config)
+        return graph
 
     def all_object_types(self) -> Set[str]:
         result: list = []
