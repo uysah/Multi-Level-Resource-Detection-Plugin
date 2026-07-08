@@ -230,35 +230,37 @@ def to_string(pair: tuple[str, str]) -> str:
     return f"{pair[0]}__{pair[1]}"
 
 
-def connected_components_undirected(types_of_level: list, type_relations) -> list:
-    """
-    Computes the connected components among a set of object types, given a set of
-    (undirected) relations between object types.
-
-    Only relations whose both endpoints are part of `types_of_level` are considered;
-    types with no relation to any other type in the level end up as singleton components.
-
-    :param types_of_level: list of object types belonging to one layer/level
-    :param type_relations: iterable of (type1, type2) tuples describing relations
-                            between object types (treated as undirected edges)
-    :return: list of sets, each set being a connected component of object types
-    """
-    graph = nx.Graph()
-
-    # ensure every type of this level is a node, even if it has no relations
-    graph.add_nodes_from(types_of_level)
-
-    types_of_level_set = set(types_of_level)
-
-    # only keep edges where both endpoints belong to this level
-    edges = [
-        (t1, t2)
-        for (t1, t2) in type_relations
-        if t1 in types_of_level_set and t2 in types_of_level_set
-    ]
-    graph.add_edges_from(edges)
-
-    return list(nx.connected_components(graph))
+def connected_components_undirected(used_nodes, edges):
+    graph = {}
+    for relation in edges:
+        for node in relation:
+            if node in used_nodes:  # Only add nodes that are in the types_of_level list
+                if node not in graph:
+                    graph[node] = set()
+                for other in relation:
+                    if other != node and other in used_nodes:
+                        graph[node].add(other)
+    
+    # Step 2: DFS to find connected components
+    def dfs(node, visited, component):
+        # Adding node to visited set and current component list
+        visited.add(node)
+        component.append(node)
+        for neighbor in graph.get(node, []):
+            if neighbor not in visited:
+                dfs(neighbor, visited, component)
+    
+    # Step 3: Find all connected components
+    visited = set()
+    connected_components = []
+    
+    for node in used_nodes:
+        if node not in visited:
+            component = []
+            dfs(node, visited, component)
+            connected_components.append(component)
+    
+    return connected_components
 
 def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
     #########################################################################
