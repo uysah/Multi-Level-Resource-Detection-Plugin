@@ -1,3 +1,4 @@
+
 # 📦 Object-Centric Inductive Miner Plugin
 
 This repository contains an **Ocelescope plugin** for discovering **Level Assignments** of Object Types and their respective **Process Areas** using the **Temporal Object Type Model (TOTeM)** [1].
@@ -16,7 +17,7 @@ The plugin is based on the implementation by Lukas Liss, available here:
 
 ## 🎥 Demo Video
 
-
+https://github.com/user-attachments/assets/0e3afa6b-cc00-4cc9-85ab-b662784468ba
 
 ## 📚 References
 [1] Lukas Liss, *TOTeM: Temporal Object Type Model for Object-Centric Process Mining*. <br> https://link.springer.com/chapter/10.1007/978-3-031-70418-5_7  
