@@ -548,6 +548,9 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
             z_initiating[to_string((t1, t2))] for (t1, t2) in tempGraph[TR_INITIATING]])
     model += obj_func
 
+    # eps = 1e-6
+    # model += obj_func + eps * pulp.lpSum(level.values())
+    # print(model)
     # solve the model
     status = model.solve()
 

@@ -1,3 +1,3 @@
 from .plugin import ResourceDetection
-
-__all__ = ["ResourceDetection"]
+from .discovery import discover_mlrd
+__all__ = ["ResourceDetection", 'discover_mlrd']
