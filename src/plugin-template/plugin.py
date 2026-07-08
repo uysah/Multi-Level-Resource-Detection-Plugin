@@ -25,9 +25,9 @@ class MineInput(PluginInput):
 
 class ResourceDetection(Plugin):
     label = "Multi-Level Resource Detection"
-    description = ""
+    description = "Discover Level Assignment of Object Types and Groups of Object Types that are Process Areas to seperate complex data into smaller, understandable parts"
     version = "1.0"
 
-    @plugin_method(label="Example", description="Example")
+    @plugin_method(label="Level Assignment and Process Areas", description="Discovers Level Assignments and Process Areas")
     def mine_totem(self, ocel: Annotated[OCEL, OCELAnnotation(label="Event Log")], input: MineInput) -> ResourceDetection:
         return mlpaDiscovery(ocel.ocel,input.tau)
