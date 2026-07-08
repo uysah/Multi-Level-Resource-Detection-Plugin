@@ -7,7 +7,6 @@ import pandas as pd
 import pm4py
 from pm4py.objects.ocel.obj import OCEL
 from pulp import *
-import json
 
 from ..resource import ResourceDetection, TotemEdge
 
@@ -463,7 +462,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
         t1, t2 = connected_types
         tempgraph['nodes'].add(t1)
         tempgraph['nodes'].add(t2)
-        print(f"{t1} -> {t2}")
 
         # get log cardinality
         lc = get_most_precise_lc((t1, t2), tau, h_log_cardinalities)
@@ -479,7 +477,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
             tempgraph[tr_i].add((t2, t1))
         else:
             tempgraph[tr].add((t1, t2))
-        print(f"TRi: {tr_i}")
 
         relation = TotemEdge(
                 source=t1,
@@ -513,7 +510,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
         edge_map[pair_key] = rel  # last one wins
 
     edges: list[TotemEdge] = list(edge_map.values())
-    print(edges)
 
     tempGraph = tempgraph
     model = LpProblem(name="layer-assignment")
@@ -553,10 +549,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
     # solve the model
     status = model.solve()
 
-    #print
-    for var in level.values():
-        print(f"{var.name}: {var.value()}")
-
     levels_dict = dict()
     for type in tempGraph['nodes']:
         # print(f"{level[type].name}: {level[type].value()}")
@@ -564,9 +556,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
         levels_dict[level[type].value()].add(type)
 
     resulting_process_view = {}
-    print("Assignment of object types to layers:")
-    print(levels_dict)
-    print("")
 
     sorted_levels = [float(k) for k in levels_dict.keys()]
     sorted_levels.sort()  # starting from the lowest level to the highest level
@@ -597,7 +586,8 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
             remaining_ev_types = remaining_ev_types - assigned_event_types
 
         resulting_process_view_with_events[l] = ccs_with_event_types
-
-    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=edges)
+    print("Resulting Process Views with matching Eventtypes:")
+    print(resulting_process_view_with_events)
+    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=edges, process_areas=resulting_process_view)
 
 
