@@ -593,6 +593,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
         resulting_process_view_with_events[l] = ccs_with_event_types
     print("Resulting Process Views with matching Eventtypes:")
     print(resulting_process_view_with_events)
-    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=edges, process_areas=resulting_process_view)
+    return ResourceDetection(object_types_to_layer=levels_dict, type_relations=edges, process_areas=resulting_process_view, process_areas_events=resulting_process_view_with_events)
 
 

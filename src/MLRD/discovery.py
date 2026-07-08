@@ -17,7 +17,7 @@ def discover_mlrd(
     tau: Annotated[
         float,
         Field(
-            gt=0,
+            ge=0,
             le=1,
             default=0.9,
             title="Support Threshold (τ)",

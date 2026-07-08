@@ -34,6 +34,7 @@ class ResourceDetection(Resource):
     object_types_to_layer: dict[float, set[str]]
     type_relations: list[TotemEdge]
     process_areas: dict[float, list[set[str]]]
+    process_areas_events: dict[float, list[tuple[list[str], set[str]]]]
 
     def visualize(self) -> Graph:
         nodes: list[GraphNode] = []
