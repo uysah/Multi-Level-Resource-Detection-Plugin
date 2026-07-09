@@ -1,5 +1,5 @@
 
-# 📦 Object-Centric Inductive Miner Plugin
+# 📦 Multi-Level Resource Detection Plugin
 
 This repository contains an **Ocelescope plugin** for discovering **Level Assignments** of Object Types and their respective **Process Areas** using the **Temporal Object Type Model (TOTeM)** [1].
 

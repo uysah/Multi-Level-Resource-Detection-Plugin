@@ -569,10 +569,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
         connected_components_undirected(types_of_level, type_relations)
         resulting_process_view[l] = connected_components_undirected(types_of_level, type_relations)
 
-    print("Process View (without matching event types):")
-    print(resulting_process_view)
-    print("")
-
     resulting_process_view_with_events = {}
     # starting from the lowest to the highest level assign the eventtypes to the object groups
     remaining_ev_types = set(list(all_event_types))
@@ -591,8 +587,6 @@ def mlpaDiscovery(ocel:OCEL,tau: float = 0.9) -> ResourceDetection:
             remaining_ev_types = remaining_ev_types - assigned_event_types
 
         resulting_process_view_with_events[l] = ccs_with_event_types
-    print("Resulting Process Views with matching Eventtypes:")
-    print(resulting_process_view_with_events)
     return ResourceDetection(object_types_to_layer=levels_dict, type_relations=edges, process_areas=resulting_process_view, process_areas_events=resulting_process_view_with_events)
 
 
