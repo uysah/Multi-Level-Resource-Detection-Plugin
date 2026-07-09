@@ -4,7 +4,7 @@
 This repository contains an **Ocelescope plugin** for discovering **Level Assignments** of Object Types and their respective **Process Areas** using the **Temporal Object Type Model (TOTeM)** [1].
 
 The plugin is based on the implementation by Lukas Liss, available here:
-[https://github.com/Nik314/OCIM](https://github.com/LukasLiss/multi-level-resource-detection) [2]
+https://github.com/LukasLiss/multi-level-resource-detection [2]
 
 ## 🚀 How to Upload
 
